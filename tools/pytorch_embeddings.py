@@ -28,7 +28,7 @@ from PIL import Image
 import torch
 import torchvision.models as models
 from torchvision import transforms
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, get_worker_info
 
 # Configure logging
 logging.basicConfig(
@@ -42,9 +42,7 @@ logging.basicConfig(
 AVAILABLE_MODELS = {
     name: getattr(models, name)
     for name in dir(models)
-    if callable(
-        getattr(models, name)
-    ) and "weights" in signature(getattr(models, name)).parameters
+    if callable(getattr(models, name)) and "weights" in signature(getattr(models, name)).parameters
 }
 
 # Default resize and normalization settings for models
@@ -76,11 +74,9 @@ MODEL_DEFAULTS = {
         [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
     )},
 }
-
-for model, settings in MODEL_DEFAULTS.items():
+for m, settings in MODEL_DEFAULTS.items():
     if "normalize" not in settings:
-        settings["normalize"] = ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-
+        settings["normalize"] = MODEL_DEFAULTS["default"]["normalize"]
 
 # Custom transform classes
 class CLAHETransform:
@@ -117,243 +113,171 @@ class RGBAtoRGBTransform:
         return img
 
 
+def worker_init_fn(worker_id):
+    """
+    Initialize each DataLoader worker with its own ZipFile handle.
+    """
+    worker_info = get_worker_info()
+    dataset = worker_info.dataset
+    dataset.zip_ref = zipfile.ZipFile(dataset.zip_file, "r")
+
+
+class ImageDataset(Dataset):
+    """
+    Dataset for reading images directly from a ZIP file.
+    """
+    def __init__(self, zip_file, file_list, transform=None):
+        self.zip_file = zip_file
+        self.file_list = file_list
+        self.transform = transform
+        self.zip_ref = None  # set in worker_init_fn
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        # use worker-local handle if present
+        zf = self.zip_ref or zipfile.ZipFile(self.zip_file, "r")
+        with zf.open(self.file_list[idx]) as fh:
+            img = Image.open(fh)
+            if self.transform:
+                img = self.transform(img)
+            return img, os.path.basename(self.file_list[idx])
+
+
+def collate_fn(batch):
+    """
+    Collate that filters out invalid items and batches tensors.
+    """
+    batch = [item for item in batch if item[0] is not None]
+    if not batch:
+        return None, None
+    images, names = zip(*batch)
+    return torch.stack(images), names
+
+
 def get_image_files_from_zip(zip_file):
-    """Returns a list of image file names in the ZIP file."""
     try:
         with zipfile.ZipFile(zip_file, "r") as zip_ref:
-            file_list = [
-                f for f in zip_ref.namelist() if f.lower().endswith(
-                    (".png", ".jpg", ".jpeg", ".bmp", ".gif")
-                )
-            ]
-        return file_list
-    except zipfile.BadZipFile as exc:
-        raise RuntimeError("Invalid ZIP file.") from exc
-    except Exception as exc:
-        raise RuntimeError("Error reading ZIP file.") from exc
+            return [f for f in zip_ref.namelist() if f.lower().endswith(
+                (".png", ".jpg", ".jpeg", ".bmp", ".gif")
+            )]
+    except zipfile.BadZipFile:
+        raise RuntimeError(f"Invalid ZIP file: {zip_file}")
 
 
 def load_model(model_name, device):
-    """Loads a specified torchvision model and 
-    modifies it for feature extraction."""
     if model_name not in AVAILABLE_MODELS:
-        raise ValueError(
-            f"Unsupported model: {model_name}. \
-            Available models: {list(AVAILABLE_MODELS.keys())}")
+        raise ValueError(f"Unsupported model: {model_name}")
     try:
-        if "weights" in inspect.signature(
-                AVAILABLE_MODELS[model_name]).parameters:
-            model = AVAILABLE_MODELS[model_name](weights="DEFAULT").to(device)
-        else:
-            model = AVAILABLE_MODELS[model_name]().to(device)
-        logging.info("Model loaded")
+        model = AVAILABLE_MODELS[model_name](weights="DEFAULT").to(device)
+        logging.info(f"Model {model_name} loaded")
     except Exception as e:
         logging.error(f"Failed to load model {model_name}: {e}")
         raise
-
-    if hasattr(model, "fc"):
-        model.fc = torch.nn.Identity()
-    elif hasattr(model, "classifier"):
-        model.classifier = torch.nn.Identity()
-    elif hasattr(model, "head"):
-        model.head = torch.nn.Identity()
-
+    # strip classifier layers
+    if hasattr(model, "fc"): model.fc = torch.nn.Identity()
+    elif hasattr(model, "classifier"): model.classifier = torch.nn.Identity()
+    elif hasattr(model, "head"): model.head = torch.nn.Identity()
     model.eval()
     return model
 
 
 def write_csv(output_csv, list_embeddings, ludwig_format=False):
-    """Writes embeddings to a CSV file, optionally in Ludwig format."""
     with open(output_csv, mode="w", encoding="utf-8", newline="") as csv_file:
-        csv_writer = csv.writer(csv_file)
+        writer = csv.writer(csv_file)
         if list_embeddings:
             if ludwig_format:
-                header = ["sample_name", "embedding"]
-                formatted_embeddings = []
-                for embedding in list_embeddings:
-                    sample_name = embedding[0]
-                    vector = embedding[1:]
-                    embedding_str = " ".join(map(str, vector))
-                    formatted_embeddings.append([sample_name, embedding_str])
-                csv_writer.writerow(header)
-                csv_writer.writerows(formatted_embeddings)
-                logging.info("CSV created in Ludwig format")
+                writer.writerow(["sample_name", "embedding"]);
+                for emb in list_embeddings:
+                    name, vec = emb[0], emb[1:]
+                    writer.writerow([name, " ".join(map(str, vec))])
             else:
-                header = ["sample_name"] + [f"vector{i + 1}" for i in range(
-                    len(list_embeddings[0]) - 1
-                )]
-                csv_writer.writerow(header)
-                csv_writer.writerows(list_embeddings)
-                logging.info("CSV created")
+                header = ["sample_name"] + [f"vector{i+1}" for i in range(len(list_embeddings[0])-1)]
+                writer.writerow(header)
+                writer.writerows(list_embeddings)
         else:
-            csv_writer.writerow(["sample_name"] if not ludwig_format
-                                else ["sample_name", "embedding"])
-            logging.info("No valid images found. Empty CSV created.")
+            writer.writerow(["sample_name", "embedding"] if ludwig_format else ["sample_name"])
 
 
 def extract_embeddings(
-        model_name,
-        apply_normalization,
-        zip_file,
-        file_list,
-        transform_type="rgb"):
-    """Extracts embeddings from images
-    using batch processing or sequential fallback."""
-
+        model_name, apply_normalization,
+        zip_file, file_list, transform_type="rgb"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_model(model_name, device)
-    model_settings = MODEL_DEFAULTS.get(model_name, MODEL_DEFAULTS["default"])
-    resize = model_settings["resize"]
-    normalize = model_settings.get("normalize", (
-        [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
-    ))
+    settings = MODEL_DEFAULTS.get(model_name, MODEL_DEFAULTS["default"])
+    resize = settings["resize"]
+    normalize = settings["normalize"]
 
-    # Define transform pipeline
+    # select initial transform
     if transform_type == "grayscale":
-        initial_transform = transforms.Grayscale(num_output_channels=3)
+        init = transforms.Grayscale(num_output_channels=3)
     elif transform_type == "clahe":
-        initial_transform = CLAHETransform()
+        init = CLAHETransform()
     elif transform_type == "edges":
-        initial_transform = CannyTransform()
+        init = CannyTransform()
     elif transform_type == "rgba_to_rgb":
-        initial_transform = RGBAtoRGBTransform()
+        init = RGBAtoRGBTransform()
     else:
-        initial_transform = transforms.Lambda(lambda x: x.convert("RGB"))
+        init = transforms.Lambda(lambda x: x.convert("RGB"))
 
-    transform_list = [initial_transform,
-                      transforms.Resize(resize),
-                      transforms.ToTensor()]
+    pipeline = [init, transforms.Resize(resize), transforms.ToTensor()]
     if apply_normalization:
-        transform_list.append(transforms.Normalize(mean=normalize[0],
-                                                   std=normalize[1]))
-    transform = transforms.Compose(transform_list)
-
-    class ImageDataset(Dataset):
-        def __init__(self, zip_file, file_list, transform=None):
-            self.zip_file = zip_file
-            self.file_list = file_list
-            self.transform = transform
-
-        def __len__(self):
-            return len(self.file_list)
-
-        def __getitem__(self, idx):
-            with zipfile.ZipFile(self.zip_file, "r") as zip_ref:
-                with zip_ref.open(self.file_list[idx]) as file:
-                    try:
-                        image = Image.open(file)
-                        if self.transform:
-                            image = self.transform(image)
-                        return image, os.path.basename(self.file_list[idx])
-                    except Exception as e:
-                        logging.warning(
-                            "Skipping %s: %s", self.file_list[idx], e
-                        )
-                        return None, os.path.basename(self.file_list[idx])
-
-    # Custom collate function
-    def collate_fn(batch):
-        batch = [item for item in batch if item[0] is not None]
-        if not batch:
-            return None, None
-        images, names = zip(*batch)
-        return torch.stack(images), names
+        pipeline.append(transforms.Normalize(mean=normalize[0], std=normalize[1]))
+    transform = transforms.Compose(pipeline)
 
     list_embeddings = []
     with torch.inference_mode():
+        # parallel loader
+        dataset = ImageDataset(zip_file, file_list, transform)
+        loader = DataLoader(
+            dataset,
+            batch_size=16,
+            num_workers=4,
+            pin_memory=(device=="cuda"),
+            collate_fn=collate_fn,
+            worker_init_fn=worker_init_fn
+        )
         try:
-            # Try DataLoader with reduced resource usage
-            dataset = ImageDataset(zip_file, file_list, transform=transform)
-            dataloader = DataLoader(
-                dataset,
-                batch_size=16,  # Reduced for lower memory usage
-                num_workers=1,  # Reduced to minimize shared memory
-                shuffle=False,
-                pin_memory=True if device == "cuda" else False,
-                collate_fn=collate_fn,
-            )
-            for images, names in dataloader:
-                if images is None:
-                    continue
-                images = images.to(device)
-                embeddings = model(images).cpu().numpy()
-                for name, embedding in zip(names, embeddings):
-                    list_embeddings.append([name] + embedding.tolist())
-        except RuntimeError as e:
-            logging.warning(
-                f"DataLoader failed: {e}. \
-                Falling back to sequential processing."
-            )
-            # Fallback to sequential processing
-            for file in file_list:
-                with zipfile.ZipFile(zip_file, "r") as zip_ref:
-                    with zip_ref.open(file) as img_file:
-                        try:
-                            image = Image.open(img_file)
-                            image = transform(image)
-                            input_tensor = image.unsqueeze(0).to(device)
-                            embedding = model(input_tensor).squeeze().cpu().numpy()
-                            list_embeddings.append(
-                                [os.path.basename(file)] + embedding.tolist()
-                            )
-                        except Exception as e:
-                            logging.warning("Skipping %s: %s", file, e)
+            for imgs, names in loader:
+                if imgs is None: continue
+                imgs = imgs.to(device)
+                embs = model(imgs).cpu().numpy()
+                for nm, e in zip(names, embs):
+                    list_embeddings.append([nm] + e.tolist())
+        except (RuntimeError, zipfile.BadZipFile) as e:
+            logging.warning(f"Parallel load failed ({type(e).__name__}: {e}), falling back.")
+            # sequential fallback
+            for f in file_list:
+                try:
+                    with zipfile.ZipFile(zip_file, "r") as zf:
+                        with zf.open(f) as fh:
+                            img = Image.open(fh)
+                            img = transform(img)
+                            inp = img.unsqueeze(0).to(device)
+                            emb = model(inp).squeeze().cpu().numpy()
+                            list_embeddings.append([os.path.basename(f)] + emb.tolist())
+                except Exception as se:
+                    logging.warning(f"Skipping {f}: {se}")
 
     return list_embeddings
 
 
-def main(zip_file, output_csv, model_name, apply_normalization=False,
-         transform_type="rgb", ludwig_format=False):
-    """Main entry point for processing the zip file and
-    extracting embeddings."""
-    file_list = get_image_files_from_zip(zip_file)
-    logging.info("Image files listed from ZIP")
-
-    list_embeddings = extract_embeddings(
-        model_name,
-        apply_normalization,
-        zip_file,
-        file_list,
-        transform_type
-    )
-    logging.info("Embeddings extracted")
-    write_csv(output_csv, list_embeddings, ludwig_format)
+def main(zip_file, output_csv, model_name,
+         apply_normalization=False, transform_type="rgb", ludwig_format=False):
+    files = get_image_files_from_zip(zip_file)
+    embs = extract_embeddings(model_name, apply_normalization, zip_file, files, transform_type)
+    write_csv(output_csv, embs, ludwig_format)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract image embeddings.")
-    parser.add_argument(
-        "--zip_file",
-        required=True,
-        help="Path to the ZIP file containing images."
-    )
-    parser.add_argument(
-        "--model_name",
-        required=True,
-        choices=AVAILABLE_MODELS.keys(),
-        help="Model for embedding extraction."
-    )
-    parser.add_argument(
-        "--normalize",
-        action="store_true",
-        help="Whether to apply normalization."
-    )
-    parser.add_argument(
-        "--transform_type",
-        required=True,
-        help="Image transformation type."
-    )
-    parser.add_argument(
-        "--output_csv",
-        required=True,
-        help="Path to the output CSV file"
-    )
-    parser.add_argument(
-        "--ludwig_format",
-        action="store_true",
-        help="Prepare CSV file in Ludwig input format"
-    )
-
+    parser.add_argument("--zip_file", required=True, help="ZIP with images.")
+    parser.add_argument("--model_name", required=True, choices=AVAILABLE_MODELS.keys())
+    parser.add_argument("--normalize", action="store_true")
+    parser.add_argument("--transform_type", required=True)
+    parser.add_argument("--output_csv", required=True)
+    parser.add_argument("--ludwig_format", action="store_true")
     args = parser.parse_args()
     main(
         args.zip_file,
